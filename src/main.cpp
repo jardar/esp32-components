@@ -1,82 +1,107 @@
 #include <Arduino.h>
-#include <FastLED.h>
+#include <WiFi.h>
+#include <esp_task_wdt.h>
 
-const int NUM_LEDS = 16;      // 填入 LED 的數量取代 #1
-const uint8_t DATA_PIN = 33;  // 填入 WS2812 通訊接腳號碼取代 #2
+#include "inc/my_wifi.h"
 
-// 定義 LED 陣列
-CRGB ws2812[NUM_LEDS];
-/*================== FASTLED =================*/
-// http://fastled.io/docs/3.1/class_c_fast_l_e_d.html#a3adb23ec5f919524928d576002cb45de
-// Colors definition for WS2812
-#define BLACK CRGB(0, 0, 0)        // Black
-#define WHITE CRGB(255, 255, 255)  // White
-#define RED CRGB(255, 0, 0)        // Red
-#define ORANGE CRGB(255, 127, 0)   // Orange
-#define YELLOW CRGB(255, 255, 0)   // Yellow
-#define GREEN CRGB(0, 255, 0)      // Green
-#define BLUE CRGB(0, 0, 255)       // Blue
-#define INDIGO CRGB(0, 255, 255)
-#define VIOLET CRGB(127, 0, 255)  // Violet
+// === watchdog ===============
+#define WDT_TIMEOUT 10  // 10 seconds
 
-CRGB x02_colors[9] = {RED,    ORANGE, YELLOW, GREEN, BLUE,
-                      INDIGO, VIOLET, WHITE,  BLACK};
+typedef enum {
+  UNKNOWN,
+  RUNNING,
+  CONNECTING,
+  CONNECTED,
+  DISCONNECTED,
+} WifiReconnectState;
 
-void blink(const int8_t blink_count, const TickType_t delayTick,
-           const CRGB color);
-void x02_testLED();
+WifiReconnectState wifiReconnectState = UNKNOWN;
+
+TaskHandle_t wifiReconnectTaskHandle;
+void wifiReconnectTask(void *pvParam);
 
 void setup() {
-  FastLED.addLeds<NEOPIXEL, DATA_PIN>(ws2812,
-                                      NUM_LEDS);  // GRB ordering is assumed
-  FastLED.setBrightness(10);
+  Serial.begin(115200);
+  Serial.println(F("\nx03_ESP32CamWiFiWatchdog Booting..."));
 
-  x02_testLED();
-  for (byte i = 0; i < 10; i++) {
-    FastLED.showColor(RED);
+  // == WiFi first connect
+  if (connectWifi()) {
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(F("cannot connect"));
+    esp_restart();
+  };
+  // == WatchDog 初始化
+  esp_task_wdt_init(WDT_TIMEOUT, true);
 
-    delay(500);
-    FastLED.showColor(BLACK);
+  /*======= WIFI RECONNECT =======*/
+  xTaskCreatePinnedToCore(wifiReconnectTask, "wifiReconnectTask", 100000, NULL,
+                          0,                           // Priotity 0
+                          &wifiReconnectTaskHandle, 0  // Core 0
+  );
+  delay(250);
 
-    delay(500);
-  }
-
-  blink(10, 500, ORANGE);
+  //* 印出 ESP32 Heap 和 PSRAM 的資訊
+  log_d("Total heap: %d", ESP.getHeapSize());
+  log_d("Free heap: %d", ESP.getFreeHeap());
+  log_d("Total PSRAM: %d", ESP.getPsramSize());
+  log_d("Free PSRAM: %d", ESP.getFreePsram());
 }
-
+// int tryRun = 0;
 void loop() {
-  // put your main code here, to run repeatedly:
+  // Serial.println(wifiReconnectState);
+  // delay(1000);
+  // tryRun++;
+  // if (tryRun % 10 == 0) {
+  //   WiFi.disconnect();
+  //   while (1) {
+  //     Serial.print(String("@") + " ");
+  //   }
+  // }
+
+  // delay(10);
 }
 
-/**========================================================================
- **                           blink()
- *?  系統運行狀態的指示
- *@param blink_count const int8_t
- *@param color       CRGB
- *========================================================================**/
-void blink(const int8_t blink_count,  // 閃爍次數
-           const TickType_t delayTick,
-           const CRGB color)  // WS2812 顏色
-{
-  uint8_t state = LOW;
-  for (int x = 0; x < (blink_count << 1); ++x) {
-    if (state ^= HIGH) {
-      ws2812[0] = color;
+// === wifi task with watchdog ===========
+void wifiReconnectTask(void *pvParam) {
+  wl_status_t wifiState,
+      wifiPreState =
+          WL_CONNECTED;  // 上次狀態必須是已連線，這樣才有機會 reconnect
+  unsigned long lastTick = 0, now = 0;
+  const long periodMs = 1000;
+
+  esp_task_wdt_add(NULL);
+
+  while (1) {
+    wifiState = WiFi.status();
+
+    if (wifiState != WL_CONNECTED && wifiPreState == WL_CONNECTED) {
+      wifiReconnectState = DISCONNECTED;
+      esp_task_wdt_reset();
+      WiFi.disconnect();
+
+      esp_task_wdt_reset();
+      wifiReconnectState = CONNECTING;
+      WiFi.reconnect();
+
+    } else if (wifiState == WL_CONNECTED && wifiPreState == WL_CONNECTED) {
+      wifiReconnectState = RUNNING;
+      esp_task_wdt_reset();
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    } else if (wifiState == WL_CONNECTED && wifiPreState != WL_CONNECTED) {
+      wifiReconnectState = CONNECTED;
+      esp_task_wdt_reset();
+
     } else {
-      ws2812[0] = BLACK;
-    }
-    FastLED.show();
-    delay(delayTick);
-  }
-}
+      now = xTaskGetTickCount();
+      if (now - lastTick > periodMs) {
+        static int i = 0;
+        Serial.print(String(++i) + " ");
+        lastTick = now;
+      }
+    }  // else
 
-/**========================================================================
- **                           testLED
- *?  顏色顯示測試
- *========================================================================**/
-void x02_testLED() {
-  for (int i = 0; i < 9; i++) {
-    blink(5, 100, x02_colors[i]);
-    delay(1450);
-  }
+    wifiPreState = wifiState;
+  }  // while
 }
